@@ -1,0 +1,704 @@
+
+import csv
+import os
+import re
+import shutil
+import threading
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from pathlib import Path
+
+import cv2
+import pytesseract
+from pytesseract import Output
+from yt_dlp import YoutubeDL
+from PIL import Image, ImageTk
+
+
+APP_NAME = "mission find Jeb.darws.things"
+
+
+def find_tesseract():
+    found = shutil.which("tesseract")
+    if found:
+        return found
+
+    candidates = [
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+class NumberScannerApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(APP_NAME)
+        self.geometry("1250x760")
+        self.minsize(1000, 650)
+
+        self.video_path = None
+        self.output_csv = None
+        self.preview_folder = None
+        self.running = False
+
+        # Keep references so Tkinter thumbnails do not disappear.
+        self.tree_images = []
+        self.preview_image_ref = None
+
+        self._build_ui()
+
+    def _build_ui(self):
+        title = ttk.Label(self, text=APP_NAME, font=("Segoe UI", 20, "bold"))
+        title.pack(pady=(16, 8))
+
+        subtitle = ttk.Label(
+            self,
+            text="Paste a video URL or choose a local video. The app scans every frame and shows a small picture of each detected number."
+        )
+        subtitle.pack(pady=(0, 12))
+
+        top = ttk.Frame(self)
+        top.pack(fill="x", padx=18)
+
+        ttk.Label(top, text="Video URL:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.url_var = tk.StringVar()
+        self.url_entry = ttk.Entry(top, textvariable=self.url_var)
+        self.url_entry.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+
+        self.download_btn = ttk.Button(top, text="Download + Scan", command=self.start_url_scan)
+        self.download_btn.grid(row=0, column=2, padx=(0, 8))
+
+        self.file_btn = ttk.Button(top, text="Choose Local Video", command=self.choose_local_video)
+        self.file_btn.grid(row=0, column=3)
+
+        top.columnconfigure(1, weight=1)
+
+        controls = ttk.Frame(self)
+        controls.pack(fill="x", padx=18, pady=(10, 8))
+
+        ttk.Label(controls, text="Minimum OCR confidence:").pack(side="left")
+        self.conf_var = tk.IntVar(value=45)
+        self.conf_spin = ttk.Spinbox(controls, from_=0, to=100, textvariable=self.conf_var, width=5)
+        self.conf_spin.pack(side="left", padx=(6, 18))
+
+        self.include_decimals = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            controls,
+            text="Keep decimals / signed numbers",
+            variable=self.include_decimals
+        ).pack(side="left", padx=(0, 18))
+
+        self.strict_mode = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            controls,
+            text="Strict detection (recommended)",
+            variable=self.strict_mode
+        ).pack(side="left")
+
+        self.status_var = tk.StringVar(value="Ready")
+        ttk.Label(self, textvariable=self.status_var).pack(fill="x", padx=18, pady=(4, 4))
+
+        self.progress = ttk.Progressbar(self, mode="determinate")
+        self.progress.pack(fill="x", padx=18, pady=(0, 12))
+
+        main = ttk.Frame(self)
+        main.pack(fill="both", expand=True, padx=18, pady=(0, 12))
+        main.columnconfigure(0, weight=4)
+        main.columnconfigure(1, weight=2)
+        main.rowconfigure(0, weight=1)
+
+        table_frame = ttk.LabelFrame(main, text="Detected numbers")
+        table_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+
+        columns = ("frame", "timestamp", "number", "confidence")
+        self.tree = ttk.Treeview(table_frame, columns=columns, show="tree headings", height=18)
+        self.tree.heading("#0", text="Number Image")
+        self.tree.column("#0", width=150, anchor="center", stretch=False)
+
+        headings = {
+            "frame": "Frame",
+            "timestamp": "Timestamp",
+            "number": "Number",
+            "confidence": "Confidence",
+        }
+        widths = {
+            "frame": 90,
+            "timestamp": 120,
+            "number": 180,
+            "confidence": 110,
+        }
+        for col in columns:
+            self.tree.heading(col, text=headings[col])
+            self.tree.column(col, width=widths[col], anchor="center")
+
+        y_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
+        x_scroll = ttk.Scrollbar(table_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid(row=1, column=0, sticky="ew")
+
+        self.tree.bind("<<TreeviewSelect>>", self.on_select_row)
+
+        side = ttk.LabelFrame(main, text="Selected detection")
+        side.grid(row=0, column=1, sticky="nsew")
+        side.columnconfigure(0, weight=1)
+
+        self.preview_label = ttk.Label(
+            side,
+            text="Click a row to see the full crop.",
+            anchor="center",
+            justify="center"
+        )
+        self.preview_label.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+
+        self.detail_var = tk.StringVar(value="No selection")
+        ttk.Label(
+            side,
+            textvariable=self.detail_var,
+            justify="left",
+            anchor="nw"
+        ).grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
+
+        bottom = ttk.Frame(self)
+        bottom.pack(fill="x", padx=18, pady=(0, 16))
+
+        self.open_csv_btn = ttk.Button(bottom, text="Open Results CSV", command=self.open_results, state="disabled")
+        self.open_csv_btn.pack(side="left")
+
+        self.open_crops_btn = ttk.Button(bottom, text="Open Crop Folder", command=self.open_crop_folder, state="disabled")
+        self.open_crops_btn.pack(side="left", padx=8)
+
+        ttk.Button(bottom, text="Clear Table", command=self.clear_table).pack(side="left", padx=8)
+
+        self.count_var = tk.StringVar(value="0 detections")
+        ttk.Label(bottom, textvariable=self.count_var).pack(side="right")
+
+    def clear_table(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self.tree_images.clear()
+        self.preview_label.configure(image="", text="Click a row to see the full crop.")
+        self.preview_image_ref = None
+        self.detail_var.set("No selection")
+        self.count_var.set("0 detections")
+
+    def set_running(self, value):
+        self.running = value
+        state = "disabled" if value else "normal"
+        self.download_btn.config(state=state)
+        self.file_btn.config(state=state)
+
+    def choose_local_video(self):
+        path = filedialog.askopenfilename(
+            title="Choose video",
+            filetypes=[
+                ("Video files", "*.mp4 *.mkv *.avi *.mov *.webm *.m4v"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        self.start_scan(path)
+
+    def start_url_scan(self):
+        url = self.url_var.get().strip()
+        if not url:
+            messagebox.showerror(APP_NAME, "Paste a video URL first.")
+            return
+
+        self.clear_table()
+        self.set_running(True)
+        self.status_var.set("Downloading video...")
+        self.progress["value"] = 0
+
+        thread = threading.Thread(target=self.download_then_scan, args=(url,), daemon=True)
+        thread.start()
+
+    def download_then_scan(self, url):
+        try:
+            downloads = Path.home() / "Downloads" / "MissionFindJeb"
+            downloads.mkdir(parents=True, exist_ok=True)
+
+            def progress_hook(d):
+                status = d.get("status")
+                if status == "downloading":
+                    total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                    downloaded = d.get("downloaded_bytes") or 0
+                    speed = d.get("speed") or 0
+                    eta = d.get("eta")
+
+                    pct = (downloaded / total * 100.0) if total else 0.0
+                    speed_mbps = speed / (1024 * 1024) if speed else 0
+                    eta_text = f", ETA {eta}s" if eta is not None else ""
+                    msg = f"Downloading video... {pct:.1f}% ({speed_mbps:.2f} MB/s{eta_text})"
+                    self.after(0, lambda: self._set_download_progress(pct, msg))
+
+                elif status == "finished":
+                    filename = d.get("filename", "")
+                    self.after(0, lambda: self.status_var.set(f"Download finished. Preparing {os.path.basename(filename)} ..."))
+
+            ydl_opts = {
+                "format": "bestvideo*+bestaudio/best/bestvideo+bestaudio",
+                "merge_output_format": "mp4",
+                "outtmpl": str(downloads / "%(title).120s [%(id)s].%(ext)s"),
+                "noplaylist": True,
+                "quiet": True,
+                "no_warnings": True,
+                "progress_hooks": [progress_hook],
+            }
+
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                requested = info.get("requested_downloads") or []
+                path = None
+
+                if requested:
+                    for item in requested:
+                        fp = item.get("filepath")
+                        if fp and os.path.exists(fp):
+                            path = fp
+                            break
+
+                if not path:
+                    candidate = ydl.prepare_filename(info)
+                    if os.path.exists(candidate):
+                        path = candidate
+                    else:
+                        stem = os.path.splitext(candidate)[0]
+                        for ext in (".mp4", ".mkv", ".webm", ".mov"):
+                            if os.path.exists(stem + ext):
+                                path = stem + ext
+                                break
+
+            if not path:
+                raise RuntimeError("The video downloaded, but the output file could not be located.")
+
+            self.after(0, lambda: self.start_scan(path, already_running=True))
+
+        except Exception as exc:
+            self.after(0, lambda: self.fail(str(exc)))
+
+    def _set_download_progress(self, pct, msg):
+        self.progress["value"] = pct
+        self.status_var.set(msg)
+
+    def start_scan(self, path, already_running=False):
+        if not already_running:
+            self.clear_table()
+            self.set_running(True)
+
+        tesseract_path = find_tesseract()
+        if not tesseract_path:
+            self.fail(
+                "Tesseract OCR was not found.\n\n"
+                "Install Tesseract OCR for Windows, then reopen the app."
+            )
+            return
+
+        pytesseract.pytesseract.tesseract_cmd = tesseract_path
+
+        self.video_path = path
+        self.status_var.set(f"Scanning: {os.path.basename(path)}")
+        self.progress["value"] = 0
+
+        thread = threading.Thread(target=self.scan_video, args=(path,), daemon=True)
+        thread.start()
+
+    def extract_numbers(self, text):
+        text = text.strip()
+        if not text:
+            return []
+
+        if self.include_decimals.get():
+            pattern = r"[-+]?(?:\d+(?:[.,]\d+)?|[.,]\d+)"
+        else:
+            pattern = r"\d+"
+
+        found = re.findall(pattern, text)
+        return [x.replace(",", ".") for x in found]
+
+    @staticmethod
+    def normalize_number_text(text):
+        """Normalize common OCR confusions only when the token is mostly number-like."""
+        t = text.strip()
+        if not t:
+            return ""
+
+        # Remove spaces inside a token.
+        t = t.replace(" ", "")
+
+        # Only correct common OCR confusions if the token already contains a digit.
+        if any(ch.isdigit() for ch in t):
+            table = str.maketrans({
+                "O": "0", "o": "0",
+                "I": "1", "l": "1", "|": "1",
+                "S": "5",
+                "B": "8",
+            })
+            t = t.translate(table)
+
+        return t
+
+    @staticmethod
+    def crop_quality_ok(crop, box_w, box_h):
+        """Reject tiny/noisy OCR boxes that commonly create random false positives."""
+        if crop is None or crop.size == 0:
+            return False
+
+        # Very tiny boxes are usually noise.
+        if box_w < 7 or box_h < 9:
+            return False
+
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+
+        # Reject almost-uniform patches.
+        if float(gray.std()) < 10.0:
+            return False
+
+        return True
+
+    def ocr_candidates_for_crop(self, crop):
+        """
+        OCR the same crop several ways. In strict mode, keep a number only when
+        at least two preprocessing passes agree on the same value.
+        """
+        if crop is None or crop.size == 0:
+            return []
+
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+
+        # Upscale: small video text is much easier for Tesseract at 2x-3x size.
+        scale = 3
+        up = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+        # Three different views of the same crop.
+        variants = [up]
+
+        _, otsu = cv2.threshold(
+            up, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
+        variants.append(otsu)
+
+        adaptive = cv2.adaptiveThreshold(
+            up, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            31, 9
+        )
+        variants.append(adaptive)
+
+        config = (
+            "--oem 3 --psm 7 "
+            "-c tessedit_char_whitelist=0123456789.,+-"
+        )
+
+        votes = {}
+        for img in variants:
+            text = pytesseract.image_to_string(img, config=config)
+            text = self.normalize_number_text(text)
+            nums = self.extract_numbers(text)
+
+            # Avoid pathological OCR strings.
+            for num in nums:
+                if len(num) > 18:
+                    continue
+                votes[num] = votes.get(num, 0) + 1
+
+        if self.strict_mode.get():
+            return [num for num, count in votes.items() if count >= 2]
+
+        return list(votes.keys())
+
+    @staticmethod
+    def timestamp_string(seconds):
+        if seconds < 0:
+            seconds = 0
+        ms = int(round((seconds - int(seconds)) * 1000))
+        total = int(seconds)
+        h = total // 3600
+        m = (total % 3600) // 60
+        s = total % 60
+        return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+
+    def make_thumbnail(self, crop_bgr, max_size=(120, 60)):
+        if crop_bgr is None or crop_bgr.size == 0:
+            img = Image.new("RGB", max_size, "white")
+        else:
+            rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(rgb)
+            img.thumbnail(max_size)
+
+            canvas = Image.new("RGB", max_size, "white")
+            x = (max_size[0] - img.width) // 2
+            y = (max_size[1] - img.height) // 2
+            canvas.paste(img, (x, y))
+            img = canvas
+
+        return ImageTk.PhotoImage(img)
+
+    def make_preview_image(self, image_path, max_size=(360, 200)):
+        img = Image.open(image_path)
+        img.thumbnail(max_size)
+        return ImageTk.PhotoImage(img)
+
+    def scan_video(self, path):
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            self.after(0, lambda: self.fail("Could not open the video."))
+            return
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if not fps or fps <= 0:
+            fps = 30.0
+
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+        output_dir = Path(path).parent
+        safe_stem = Path(path).stem
+        csv_path = output_dir / f"{safe_stem}_numbers.csv"
+        crops_dir = output_dir / f"{safe_stem}_number_crops"
+        crops_dir.mkdir(parents=True, exist_ok=True)
+
+        detections = []
+        frame_index = 0
+        min_conf = int(self.conf_var.get())
+
+        tess_config = (
+            "--oem 3 --psm 11 "
+            "-c tessedit_char_whitelist=0123456789.,+-"
+        )
+
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+                # First pass finds possible text boxes across the whole frame.
+                # A higher threshold is used in strict mode to reduce random detections.
+                data = pytesseract.image_to_data(
+                    gray,
+                    config=tess_config,
+                    output_type=Output.DICT
+                )
+
+                frame_rows = []
+                n = len(data["text"])
+                for i in range(n):
+                    raw = str(data["text"][i]).strip()
+
+                    try:
+                        conf = float(data["conf"][i])
+                    except (ValueError, TypeError):
+                        conf = -1
+
+                    effective_min_conf = max(min_conf, 62) if self.strict_mode.get() else min_conf
+                    if conf < effective_min_conf:
+                        continue
+
+                    # Require the first OCR pass to contain at least one digit.
+                    # This prevents punctuation and random texture from being promoted.
+                    normalized_raw = self.normalize_number_text(raw)
+                    if not any(ch.isdigit() for ch in normalized_raw):
+                        continue
+
+                    x = int(data["left"][i])
+                    y = int(data["top"][i])
+                    w = int(data["width"][i])
+                    h = int(data["height"][i])
+
+                    # Add a small padding border around the candidate.
+                    pad_x = max(2, int(w * 0.18))
+                    pad_y = max(2, int(h * 0.25))
+                    x1 = max(0, x - pad_x)
+                    y1 = max(0, y - pad_y)
+                    x2 = min(frame.shape[1], x + w + pad_x)
+                    y2 = min(frame.shape[0], y + h + pad_y)
+                    crop = frame[y1:y2, x1:x2]
+
+                    if not self.crop_quality_ok(crop, w, h):
+                        continue
+
+                    # Second stage: re-read the crop multiple ways.
+                    numbers = self.ocr_candidates_for_crop(crop)
+                    if not numbers:
+                        continue
+
+                    seconds = frame_index / fps
+                    ts = self.timestamp_string(seconds)
+
+                    crop_filename = f"frame_{frame_index:08d}_box_{i:04d}.png"
+                    crop_path = crops_dir / crop_filename
+                    cv2.imwrite(str(crop_path), crop)
+
+                    for number in numbers:
+                        row = {
+                            "frame": frame_index,
+                            "timestamp": ts,
+                            "seconds": round(seconds, 6),
+                            "number": number,
+                            "confidence": round(conf, 2),
+                            "crop_file": str(crop_path),
+                        }
+                        detections.append(row)
+                        frame_rows.append(row)
+
+                if frame_rows:
+                    self.after(0, self.add_rows, frame_rows)
+
+                frame_index += 1
+
+                if frame_count > 0:
+                    pct = min(100.0, (frame_index / frame_count) * 100.0)
+                    self.after(0, self.update_progress, pct, frame_index, frame_count)
+                elif frame_index % 10 == 0:
+                    self.after(
+                        0,
+                        lambda fi=frame_index: self.status_var.set(
+                            f"Scanning frame {fi:,}..."
+                        )
+                    )
+
+            cap.release()
+
+            with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=[
+                        "frame",
+                        "timestamp",
+                        "seconds",
+                        "number",
+                        "confidence",
+                        "crop_file",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerows(detections)
+
+            self.output_csv = str(csv_path)
+            self.preview_folder = str(crops_dir)
+            self.after(0, lambda: self.finish(len(detections), frame_index, str(csv_path)))
+
+        except Exception as exc:
+            cap.release()
+            self.after(0, lambda: self.fail(str(exc)))
+
+    def add_rows(self, rows):
+        for row in rows:
+            try:
+                img = Image.open(row["crop_file"])
+                img.thumbnail((120, 60))
+                canvas = Image.new("RGB", (120, 60), "white")
+                x = (120 - img.width) // 2
+                y = (60 - img.height) // 2
+                canvas.paste(img, (x, y))
+                thumb = ImageTk.PhotoImage(canvas)
+            except Exception:
+                thumb = self.make_thumbnail(None)
+
+            self.tree_images.append(thumb)
+
+            item_id = self.tree.insert(
+                "",
+                "end",
+                text="",
+                image=thumb,
+                values=(
+                    row["frame"],
+                    row["timestamp"],
+                    row["number"],
+                    row["confidence"],
+                ),
+            )
+            self.tree.set(item_id, "frame", row["frame"])
+            self.tree.item(item_id, tags=(row["crop_file"],))
+
+        count = len(self.tree.get_children())
+        self.count_var.set(f"{count:,} detections")
+
+    def on_select_row(self, event=None):
+        selected = self.tree.selection()
+        if not selected:
+            return
+
+        item = selected[0]
+        values = self.tree.item(item, "values")
+        tags = self.tree.item(item, "tags")
+        crop_file = tags[0] if tags else None
+
+        if crop_file and os.path.exists(crop_file):
+            try:
+                preview = self.make_preview_image(crop_file)
+                self.preview_label.configure(image=preview, text="")
+                self.preview_image_ref = preview
+            except Exception:
+                self.preview_label.configure(image="", text="Could not load preview image.")
+                self.preview_image_ref = None
+        else:
+            self.preview_label.configure(image="", text="Preview image not found.")
+            self.preview_image_ref = None
+
+        if values:
+            frame, timestamp, number, confidence = values
+            self.detail_var.set(
+                f"Number: {number}\n"
+                f"Frame: {frame}\n"
+                f"Timestamp: {timestamp}\n"
+                f"Confidence: {confidence}\n"
+                f"Crop file:\n{crop_file or 'N/A'}"
+            )
+
+    def update_progress(self, pct, frame_index, frame_count):
+        self.progress["value"] = pct
+        self.status_var.set(
+            f"Scanning frame {frame_index:,} of {frame_count:,}  ({pct:.1f}%)"
+        )
+
+    def finish(self, detections, frames, csv_path):
+        self.progress["value"] = 100
+        self.status_var.set(
+            f"Done — scanned {frames:,} frames and found {detections:,} number detections."
+        )
+        self.count_var.set(f"{detections:,} detections")
+        self.open_csv_btn.config(state="normal")
+        self.open_crops_btn.config(state="normal")
+        self.set_running(False)
+        messagebox.showinfo(
+            APP_NAME,
+            f"Finished.\n\nScanned frames: {frames:,}\n"
+            f"Number detections: {detections:,}\n\nCSV:\n{csv_path}"
+        )
+
+    def fail(self, message):
+        self.set_running(False)
+        self.status_var.set("Error")
+        messagebox.showerror(APP_NAME, message)
+
+    def open_results(self):
+        if self.output_csv and os.path.exists(self.output_csv):
+            os.startfile(self.output_csv)
+        else:
+            messagebox.showerror(APP_NAME, "No results CSV is available yet.")
+
+    def open_crop_folder(self):
+        if self.preview_folder and os.path.exists(self.preview_folder):
+            os.startfile(self.preview_folder)
+        else:
+            messagebox.showerror(APP_NAME, "No crop folder is available yet.")
+
+
+if __name__ == "__main__":
+    app = NumberScannerApp()
+    app.mainloop()
